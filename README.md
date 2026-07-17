@@ -35,16 +35,19 @@ silicon, VideoToolbox path; identical divergent-frame sets in each):
 - Google Chrome 139.0.7258.67 (stable) — 18/240 in every hardware variant, 0/240 software.
 - Chromium 148.0.7778.271 (Electron 42.5.1 embedded browser) — same 18/240 vs 0/240.
 - Chrome 150.0.7871.115 — same visible symptom in the originating application.
-- Windows `<FILL IN Windows version>`, Edge `<FILL IN Edge version>` (D3D11/DXVA
+
+Also tested on Windows `25H2 26200.8655, Edge`Version 150.0.4078.65 (Official build) (64-bit) (D3D11/DXVA
   path) — same visible symptom in the originating application, so this is not
   specific to one hardware vendor or OS decode backend.
-  `<TODO: re-verify on Windows/Edge with this page before filing>`
+
+As a sanity check, neither Firefox nightly on Windows and Safari on macOS show any macroblock corruption on hardware encode. Safari results in completely clean 0/240 diff between hardware and software, while Firefox appears to have an unrelated bug where software decoding seems to overexpose frames causing diffs, but none of the hardware encoded frames exhibit the same corruption patterns.
 
 ## Why the input is known-good
 
 - ffmpeg (libavcodec software) decodes all 240 access units with zero errors and
   produces the expected pixels.
 - Chrome's own `prefer-software` decode matches ffmpeg on all 240 frames.
+- Safari and Firefox hardware decode also match ffmpeg output on all frames.
 - The fixture is the byte-exact stream as received over the wire in the
   originating application; per-frame payload hashes were verified identical at
   the encoder, the relay, and the receiving browser.

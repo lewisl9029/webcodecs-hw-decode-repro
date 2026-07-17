@@ -6,7 +6,7 @@ H.264 stream. Small runs of macroblocks keep their previous contents instead of
 being updated. No error is raised, `decode()` never throws, and every chunk
 produces an `output()` frame.
 
-**Live page: `<FILL IN after deploy>`** — open it in Chrome and it runs itself.
+**Live page: <https://webcodecs-hw-decode-repro.lewisl.workers.dev>** — open it in Chrome and it runs itself.
 
 ![Software decode draws the search icon; hardware decode leaves the macroblocks stale; the amplified difference is exactly the missing icon](public/docs/stale-macroblocks.png)
 

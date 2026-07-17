@@ -10,7 +10,7 @@ produces an `output()` frame.
 
 ![Software decode draws the search icon; hardware decode leaves the macroblocks stale; the amplified difference is exactly the missing icon](public/docs/stale-macroblocks.png)
 
-Frame index 56 of the fixture, decoded twice from identical bytes in Chrome 139 on macOS: software (left) draws the omnibox search icon, hardware (middle) leaves those macroblocks at their previous contents, and the 6x-amplified difference (right) is exactly the icon that was never applied.
+Frame index 56 of the fixture, decoded twice from identical bytes in Chromium 148 on macOS 26.5.1 (Apple silicon): software (left) draws the omnibox search icon, hardware (middle) leaves those macroblocks at their previous contents, and the 6x-amplified difference (right) is exactly the icon that was never applied.
 
 The page decodes the same 240-frame stream twice, once with
 `hardwareAcceleration: 'prefer-hardware'` and once with `'prefer-software'`,
@@ -34,20 +34,33 @@ silicon, VideoToolbox path; identical divergent-frame sets in each):
 
 - Google Chrome 139.0.7258.67 (stable) — 18/240 in every hardware variant, 0/240 software.
 - Chromium 148.0.7778.271 (Electron 42.5.1 embedded browser) — same 18/240 vs 0/240.
-- Chrome 150.0.7871.115 — same visible symptom in the originating application.
 
-Also tested on Windows `25H2 26200.8655, Edge`Version 150.0.4078.65 (Official build) (64-bit) (D3D11/DXVA
-  path) — same visible symptom in the originating application, so this is not
-  specific to one hardware vendor or OS decode backend.
+Also seen on Windows 25H2 (26200.8655) in Edge 150.0.4078.65 (Official build,
+64-bit; D3D11/DXVA path): the same visible symptom in the originating
+application, so this is not specific to one hardware vendor or one OS decode
+backend.
 
-As a sanity check, neither Firefox nightly on Windows and Safari on macOS show any macroblock corruption on hardware encode. Safari results in completely clean 0/240 diff between hardware and software, while Firefox appears to have an unrelated bug where software decoding seems to overexpose frames causing diffs, but none of the hardware encoded frames exhibit the same corruption patterns.
+**Other browsers driving the same hardware decoders are clean.** This is the
+strongest signal here: it points at Chromium's hardware decode path rather than
+at the platform decoder or at the stream.
+
+- **Safari on macOS** — the same VideoToolbox decoder Chrome uses: **0/240**, a
+  completely clean hardware-vs-software diff.
+- **Firefox Nightly on Windows** — the same D3D11 decoder Edge uses: none of the
+  hardware-decoded frames show the corruption pattern. (Firefox does show an
+  unrelated difference in which its *software* decode appears to overexpose
+  frames, which inflates its raw diff count; the stale-macroblock pattern is
+  absent from its hardware output.)
 
 ## Why the input is known-good
 
 - ffmpeg (libavcodec software) decodes all 240 access units with zero errors and
   produces the expected pixels.
 - Chrome's own `prefer-software` decode matches ffmpeg on all 240 frames.
-- Safari and Firefox hardware decode also match ffmpeg output on all frames.
+- Safari's hardware decode diverges from its own software decode on 0 of 240
+  frames, and Firefox's hardware decode shows none of the corruption pattern —
+  so two independent hardware decoders handle this stream correctly when they
+  are not driven by Chromium.
 - The fixture is the byte-exact stream as received over the wire in the
   originating application; per-frame payload hashes were verified identical at
   the encoder, the relay, and the receiving browser.

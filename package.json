@@ -1,0 +1,14 @@
+{
+  "name": "webcodecs-hw-decode-repro",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-contained browser repro: WebCodecs hardware H.264 decode produces stale macroblocks on a valid stream",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.111.0"
+  }
+}

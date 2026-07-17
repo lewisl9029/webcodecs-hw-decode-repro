@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "webcodecs-hw-decode-repro",
+  "compatibility_date": "2026-07-16",
+  // Static-assets-only Worker: no server code, the harness runs entirely in the
+  // visiting browser. `public/` holds index.html plus the H.264 fixture.
+  "assets": {
+    "directory": "./public"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

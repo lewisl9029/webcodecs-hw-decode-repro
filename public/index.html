@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WebCodecs hardware H.264 decode — stale macroblock repro</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px;
+  }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin-top: 32px; }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .lede { color: #666; margin-top: 0; }
+  @media (prefers-color-scheme: dark) { .lede { color: #aaa; } }
+  #status {
+    padding: 10px 12px; border-radius: 6px; margin: 16px 0;
+    background: #eef2ff; border: 1px solid #c7d2fe;
+  }
+  @media (prefers-color-scheme: dark) {
+    #status { background: #1e1b4b; border-color: #3730a3; }
+  }
+  #verdict { font-weight: 600; padding: 12px; border-radius: 6px; margin: 16px 0; display: none; }
+  .bad  { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+  .good { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; }
+  @media (prefers-color-scheme: dark) {
+    .bad  { background: #450a0a; border-color: #7f1d1d; color: #fca5a5; }
+    .good { background: #052e16; border-color: #166534; color: #86efac; }
+  }
+  table { border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+  th, td { border: 1px solid #d4d4d8; padding: 5px 10px; text-align: left; }
+  th { background: #fafafa; }
+  @media (prefers-color-scheme: dark) {
+    th, td { border-color: #3f3f46; } th { background: #27272a; }
+  }
+  td.diverge-yes { color: #b91c1c; font-weight: 600; }
+  td.diverge-no  { color: #15803d; font-weight: 600; }
+  .row { margin: 14px 0 22px; }
+  .row-label { font-size: 12px; margin-bottom: 4px; }
+  .crops { display: flex; gap: 12px; flex-wrap: wrap; }
+  .crop { }
+  .crop figcaption { font-size: 11px; text-align: center; margin: 2px 0 0; color: #666; }
+  canvas.region {
+    image-rendering: pixelated; border: 1px solid #d4d4d8; display: block;
+    width: 384px; height: 192px; background: #fff;
+  }
+  button {
+    font: inherit; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid #a1a1aa; background: #fff; cursor: pointer;
+  }
+  @media (prefers-color-scheme: dark) { button { background: #27272a; color: inherit; } }
+  #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; color: #71717a; }
+</style>
+
+<h1>WebCodecs hardware H.264 decode produces stale macroblocks</h1>
+<p class="lede">
+  This page decodes one 240-frame H.264 stream twice in your browser — once with
+  <code>hardwareAcceleration: 'prefer-hardware'</code>, once with
+  <code>'prefer-software'</code> — and compares the pixels. The bytes are identical;
+  only the decoder differs. Where the two disagree, the hardware decoder has silently
+  left macroblocks at their previous contents. No error is raised and every chunk
+  produces an output frame.
+</p>
+
+<div id="status">loading fixture…</div>
+<div id="verdict"></div>
+
+<h2>Results</h2>
+<table id="results">
+  <thead>
+    <tr>
+      <th>variant</th><th>hardwareAcceleration</th><th>optimizeForLatency</th>
+      <th>pacing</th><th>outputs</th><th>errors</th><th>frames differing from software</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+<p><button id="download" disabled>Download results JSON</button></p>
+
+<h2>Environment</h2>
+<pre class="mono" id="env"></pre>
+
+<div id="diffs"></div>
+
+<h2>Log</h2>
+<pre id="log"></pre>
+
+<script type="module">
+// Replays a byte-exact capture of a real WebRTC-style H.264 stream (x264
+// ultrafast + zerolatency, 4 slices/AU, 2780x1668) through VideoDecoder under
+// several configurations and diffs the decoded pixels between them.
+//
+// The software decode is the baseline: it matches ffmpeg's decode of the same
+// bytes on all 240 frames, so a hardware/software disagreement is a hardware
+// decode defect, not an ambiguity in the stream.
+const FIXTURE = '019f6c88-surface-1';
+const CODEC = 'avc1.42e01e';
+const WIDTH = 2780, HEIGHT = 1668;
+// The compared window covers the macroblocks where the defect appears
+// (MB-aligned superset of the observed stale blocks).
+const REGION = { x: 128, y: 128, w: 192, h: 96 };
+const BLOCK = 16;
+// Block-mean deltas from decoder rounding differences run ~1-2 levels; the
+// observed stale-macroblock shift is ~17+. Midpoint keeps both margins wide.
+const THRESHOLD = 8.0;
+
+const VARIANTS = [
+  // Software first: it is the conformant baseline every other variant is
+  // compared against.
+  { name: 'sw-lowlat-paced',     hw: 'prefer-software', lowLatency: true,  paced: true },
+  { name: 'hw-lowlat-paced',     hw: 'prefer-hardware', lowLatency: true,  paced: true },
+  { name: 'hw-plain-paced',      hw: 'prefer-hardware', lowLatency: false, paced: true },
+  { name: 'hw-lowlat-fast',      hw: 'prefer-hardware', lowLatency: true,  paced: false },
+  { name: 'nopref-lowlat-paced', hw: 'no-preference',   lowLatency: true,  paced: true },
+];
+
+const statusEl = document.getElementById('status');
+const verdictEl = document.getElementById('verdict');
+const logEl = document.getElementById('log');
+const tbody = document.querySelector('#results tbody');
+const diffsEl = document.getElementById('diffs');
+const log = (m) => { logEl.textContent += m + '\n'; };
+const setStatus = (m) => { statusEl.textContent = m; };
+document.getElementById('env').textContent =
+  `userAgent: ${navigator.userAgent}\nplatform:  ${navigator.platform}`;
+
+async function loadDump() {
+  const [binRes, idxRes] = await Promise.all([
+    fetch(`./fixtures/${FIXTURE}.bin`),
+    fetch(`./fixtures/${FIXTURE}.idx`),
+  ]);
+  const bin = new Uint8Array(await binRes.arrayBuffer());
+  const idxText = await idxRes.text();
+  const frames = [];
+  let offset = 0;
+  for (const line of idxText.trim().split('\n')) {
+    const [index, frameId, epoch, key, len, atNs] = line.trim().split(/\s+/).map(Number);
+    frames.push({ index, frameId, epoch, key: key === 1, len, atNs, offset });
+    offset += len;
+  }
+  if (offset !== bin.byteLength) {
+    throw new Error(`idx/bin mismatch: idx total ${offset} vs bin ${bin.byteLength}`);
+  }
+  return { bin, frames };
+}
+
+function blockGrid(imageData) {
+  const { data, width, height } = imageData;
+  const cols = width / BLOCK, rows = height / BLOCK;
+  const grid = [];
+  for (let by = 0; by < rows; by++) {
+    for (let bx = 0; bx < cols; bx++) {
+      let sum = 0;
+      for (let y = by * BLOCK; y < (by + 1) * BLOCK; y++) {
+        for (let x = bx * BLOCK; x < (bx + 1) * BLOCK; x++) {
+          const o = (y * width + x) * 4;
+          sum += data[o] + data[o + 1] + data[o + 2];
+        }
+      }
+      grid.push(Math.round((sum / (BLOCK * BLOCK * 3)) * 100) / 100);
+    }
+  }
+  return grid;
+}
+
+async function runVariant({ name, hw, lowLatency, paced }, dump, regionStore) {
+  setStatus(`running ${name} (${hw})…`);
+  const config = { codec: CODEC, hardwareAcceleration: hw, optimizeForLatency: lowLatency };
+  const support = await VideoDecoder.isConfigSupported(config).catch((e) => ({ error: String(e) }));
+  const result = {
+    name, hw, lowLatency, paced,
+    userAgent: navigator.userAgent,
+    supported: support?.supported ?? null,
+    supportError: support?.error ?? null,
+    errors: [], frames: [], outputs: 0,
+  };
+  if (support?.supported === false) {
+    log(`${name}: config unsupported, skipping`);
+    return result;
+  }
+
+  const canvas = new OffscreenCanvas(WIDTH, HEIGHT);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const byTimestamp = new Map();
+  const submitAt = new Map();
+  const decodeMs = [];
+  let resolveDone;
+  const done = new Promise((r) => { resolveDone = r; });
+  let outstanding = 0;
+  let submittedAll = false;
+
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      try {
+        const index = byTimestamp.get(frame.timestamp);
+        const t = submitAt.get(frame.timestamp);
+        if (t !== undefined) decodeMs.push(performance.now() - t);
+        ctx.drawImage(frame, 0, 0);
+        const img = ctx.getImageData(REGION.x, REGION.y, REGION.w, REGION.h);
+        result.frames.push({ i: index, grid: blockGrid(img) });
+        if (regionStore) regionStore.set(index, img);
+        result.outputs++;
+      } catch (err) {
+        result.errors.push(`output ${frame.timestamp}: ${err}`);
+      } finally {
+        frame.close();
+        outstanding--;
+        if (submittedAll && outstanding === 0) resolveDone();
+      }
+    },
+    error: (err) => {
+      result.errors.push(`decoder error: ${err?.message ?? err}`);
+      resolveDone();
+    },
+  });
+  decoder.configure(config);
+
+  const t0 = performance.now();
+  const base = dump.frames[0].atNs;
+  for (const f of dump.frames) {
+    if (decoder.state !== 'configured') break;
+    if (paced) {
+      // Replay with the recorded arrival pacing (the capture includes idle gaps
+      // of 100-200ms); cap any single wait so a stray timestamp cannot stall.
+      const dueMs = Math.min((f.atNs - base) / 1e6, (f.index * 16.7) + 60_000);
+      const wait = dueMs - (performance.now() - t0);
+      if (wait > 1) await new Promise((r) => setTimeout(r, Math.min(wait, 1500)));
+    } else if (decoder.decodeQueueSize > 8) {
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    // Index-based timestamps: the recorded arrival times have millisecond
+    // granularity, so adjacent frames can collide and mis-map outputs.
+    const timestamp = f.index;
+    byTimestamp.set(timestamp, f.index);
+    submitAt.set(timestamp, performance.now());
+    outstanding++;
+    try {
+      decoder.decode(new EncodedVideoChunk({
+        type: f.key ? 'key' : 'delta',
+        timestamp,
+        data: dump.bin.subarray(f.offset, f.offset + f.len),
+      }));
+    } catch (err) {
+      result.errors.push(`decode(${f.index}): ${err}`);
+      outstanding--;
+      break;
+    }
+  }
+  submittedAll = true;
+  if (outstanding === 0) resolveDone();
+  try { await decoder.flush(); } catch (err) { result.errors.push(`flush: ${err}`); }
+  await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);
+  try { decoder.close(); } catch { /* already closed */ }
+  result.frames.sort((a, b) => a.i - b.i);
+  decodeMs.sort((a, b) => a - b);
+  const pick = (q) => (decodeMs.length ? Math.round(decodeMs[Math.floor(decodeMs.length * q)] * 10) / 10 : null);
+  result.decodeMsP50 = pick(0.5);
+  result.decodeMsP95 = pick(0.95);
+  result.decodeMsMax = decodeMs.length ? Math.round(decodeMs[decodeMs.length - 1] * 10) / 10 : null;
+  log(`${name}: outputs=${result.outputs}/${dump.frames.length} errors=${result.errors.length} ` +
+      `decodeMs p50=${result.decodeMsP50} p95=${result.decodeMsP95}`);
+  return result;
+}
+
+function maxBlockDelta(a, b) {
+  let worst = 0;
+  for (let k = 0; k < a.length; k++) worst = Math.max(worst, Math.abs(a[k] - b[k]));
+  return worst;
+}
+
+function divergentFrames(baseline, result) {
+  const gridByIndex = new Map(baseline.frames.map((f) => [f.i, f.grid]));
+  const out = [];
+  for (const f of result.frames) {
+    const base = gridByIndex.get(f.i);
+    if (!base) continue;
+    const worst = maxBlockDelta(base, f.grid);
+    if (worst > THRESHOLD) out.push({ i: f.i, worst: Math.round(worst * 10) / 10 });
+  }
+  return out;
+}
+
+function renderRegion(img, caption) {
+  const fig = document.createElement('figure');
+  fig.className = 'crop';
+  fig.style.margin = '0';
+  const c = document.createElement('canvas');
+  c.className = 'region';
+  c.width = REGION.w; c.height = REGION.h;
+  c.getContext('2d').putImageData(img, 0, 0);
+  fig.appendChild(c);
+  const cap = document.createElement('figcaption');
+  cap.textContent = caption;
+  fig.appendChild(cap);
+  return fig;
+}
+
+// |software - hardware| per channel, amplified 6x, so the stale macroblocks
+// read as bright rectangles against black instead of a subtle gray shift.
+function diffImage(a, b) {
+  const out = new ImageData(REGION.w, REGION.h);
+  for (let k = 0; k < a.data.length; k += 4) {
+    for (let ch = 0; ch < 3; ch++) {
+      out.data[k + ch] = Math.min(255, Math.abs(a.data[k + ch] - b.data[k + ch]) * 6);
+    }
+    out.data[k + 3] = 255;
+  }
+  return out;
+}
+
+function renderDiffSection(baseline, variant, ids, divergent) {
+  const MAX_ROWS = 12;
+  const section = document.createElement('div');
+  const h = document.createElement('h2');
+  h.textContent = `${variant.result.name}: ${divergent.length} frames differ from ${baseline.result.name}`;
+  section.appendChild(h);
+  for (const d of divergent.slice(0, MAX_ROWS)) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('div');
+    label.className = 'row-label mono';
+    label.textContent =
+      `frame index ${d.i} (capture frame id ${ids.get(d.i) ?? '?'}) — max 16x16 block delta ${d.worst} levels`;
+    row.appendChild(label);
+    const crops = document.createElement('div');
+    crops.className = 'crops';
+    const baseImg = baseline.store.get(d.i);
+    const varImg = variant.store.get(d.i);
+    if (baseImg) crops.appendChild(renderRegion(baseImg, `${baseline.result.name} (correct)`));
+    if (varImg) crops.appendChild(renderRegion(varImg, `${variant.result.name}`));
+    if (baseImg && varImg) crops.appendChild(renderRegion(diffImage(baseImg, varImg), 'difference (6x)'));
+    row.appendChild(crops);
+    section.appendChild(row);
+  }
+  if (divergent.length > MAX_ROWS) {
+    const more = document.createElement('div');
+    more.className = 'mono';
+    more.textContent = `… and ${divergent.length - MAX_ROWS} more frames`;
+    section.appendChild(more);
+  }
+  diffsEl.appendChild(section);
+}
+
+function addRow(r, divergentCount) {
+  const tr = document.createElement('tr');
+  const cells = [
+    r.name, r.hw, String(r.lowLatency), r.paced ? 'recorded' : 'full speed',
+    `${r.outputs}`, `${r.errors.length}`,
+    divergentCount === null ? 'baseline' : `${divergentCount}`,
+  ];
+  cells.forEach((text, k) => {
+    const td = document.createElement('td');
+    td.textContent = text;
+    if (k === 6 && divergentCount !== null) {
+      td.className = divergentCount > 0 ? 'diverge-yes' : 'diverge-no';
+    }
+    tr.appendChild(td);
+  });
+  tbody.appendChild(tr);
+}
+
+try {
+  if (!('VideoDecoder' in self)) throw new Error('WebCodecs VideoDecoder is not available in this browser');
+  const dump = await loadDump();
+  log(`loaded ${dump.frames.length} access units, ${dump.bin.byteLength} bytes, ${WIDTH}x${HEIGHT}`);
+  const ids = new Map(dump.frames.map((f) => [f.index, f.frameId]));
+  const all = [];
+  let baseline = null;
+  let worstDivergence = 0;
+
+  for (const variant of VARIANTS) {
+    const store = new Map();
+    const r = await runVariant(variant, dump, store);
+    all.push(r);
+    if (!baseline && variant.hw === 'prefer-software' && r.outputs > 0) {
+      baseline = { result: r, store };
+      addRow(r, null);
+      continue;
+    }
+    if (!baseline || r.outputs === 0) { addRow(r, null); continue; }
+    const divergent = divergentFrames(baseline.result, r);
+    r.divergentFrames = divergent;
+    worstDivergence = Math.max(worstDivergence, divergent.length);
+    addRow(r, divergent.length);
+    if (divergent.length) renderDiffSection(baseline, { result: r, store }, ids, divergent);
+  }
+
+  setStatus(`done — ${all.length} variants, ${dump.frames.length} frames each`);
+  verdictEl.style.display = 'block';
+  if (worstDivergence > 0) {
+    verdictEl.className = 'bad';
+    verdictEl.textContent =
+      `REPRODUCED: hardware decode disagrees with software decode on up to ${worstDivergence} of ` +
+      `${dump.frames.length} frames from identical bytes. See the side-by-side crops below.`;
+  } else {
+    verdictEl.className = 'good';
+    verdictEl.textContent =
+      'Not reproduced on this machine: hardware and software decode agree on every frame. ' +
+      'This browser may have no hardware H.264 decoder available (check the outputs/errors columns ' +
+      'and chrome://gpu), or the defect may not affect this decoder.';
+  }
+
+  const blob = new Blob([JSON.stringify({ fixture: FIXTURE, results: all }, null, 2)],
+                        { type: 'application/json' });
+  const btn = document.getElementById('download');
+  btn.disabled = false;
+  btn.addEventListener('click', () => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'webcodecs-hw-decode-results.json';
+    a.click();
+  });
+} catch (err) {
+  setStatus(`FAILED: ${err}`);
+  log(String(err?.stack ?? err));
+}
+</script>
+</html>

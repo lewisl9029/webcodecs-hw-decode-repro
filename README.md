@@ -18,27 +18,35 @@ and diffs the decoded pixels. The bytes are identical; only the decoder differs.
 
 ## Result on the machines tested so far
 
-| variant | frames differing from software decode (of 240) |
-|---|---|
-| `prefer-hardware`, `optimizeForLatency: true`, recorded pacing | 18 |
-| `prefer-hardware`, `optimizeForLatency: true`, full speed | 18 (same frames) |
-| `prefer-hardware`, `optimizeForLatency: false` | 18 (same frames) |
-| `no-preference` (resolves to hardware) | 18 (same frames) |
-| `prefer-software` | 0 (baseline) |
+| variant | Chrome 150 / macOS (VideoToolbox) | Edge 150 / Windows (D3D11) |
+|---|---|---|
+| `prefer-hardware`, `optimizeForLatency: true`, recorded pacing | 18 | 35 |
+| `prefer-hardware`, `optimizeForLatency: true`, full speed | 18 (same frames) | 35 |
+| `prefer-hardware`, `optimizeForLatency: false` | 18 (same frames) | 35 |
+| `no-preference` (resolves to hardware) | 18 (same frames) | 35 |
+| `prefer-software` | 0 (baseline) | 0 (baseline) |
 
-Deterministic: the same 18 frames every run (stream indices 56–65 and 183–192),
-independent of pacing and of `optimizeForLatency`.
+Every row: 240 outputs, 0 errors. Nothing fails — the pixels are just wrong.
+
+Deterministic: on macOS, the same 18 frames every run (stream indices 56–65 and
+183–192), independent of pacing and of `optimizeForLatency`.
 
 Observed on (all macOS runs on one machine: macOS 26.5.1 build 25F80, Apple
 silicon, VideoToolbox path; identical divergent-frame sets in each):
 
+- **Google Chrome 150.0.7871.129 (stable, current)** — 18/240 in every hardware
+  variant, 0/240 software. Same frame set as Chrome 139 below.
 - Google Chrome 139.0.7258.67 (stable) — 18/240 in every hardware variant, 0/240 software.
 - Chromium 148.0.7778.271 (Electron 42.5.1 embedded browser) — same 18/240 vs 0/240.
 
-Also seen on Windows 25H2 (26200.8655) in Edge 150.0.4078.65 (Official build,
-64-bit; D3D11/DXVA path): the same visible symptom in the originating
-application, so this is not specific to one hardware vendor or one OS decode
-backend.
+Unchanged across eleven major Chrome versions (139 → 150), on the same machine,
+down to the identical divergent frames.
+
+**Windows 25H2 (26200.8655), Edge 150.0.4078.65 (Official build, 64-bit;
+D3D11/DXVA path)** — this page reports **35/240** differing on every hardware
+variant, 0/240 software, 240 outputs and 0 errors throughout. A different
+hardware decoder fails on a different number of frames, in the same way. So the
+defect is not specific to one hardware vendor or one OS decode backend.
 
 **Other browsers driving the same hardware decoders are clean.** This is the
 strongest signal here: it points at Chromium's hardware decode path rather than

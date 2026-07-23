@@ -18,7 +18,7 @@ and diffs the decoded pixels. The bytes are identical; only the decoder differs.
 
 ## Result on the machines tested so far
 
-| variant | Chrome 150 / macOS (VideoToolbox) | Edge 150 / Windows (D3D11) |
+| variant (`drawImage` readback) | Chrome 150 / macOS (VideoToolbox) | Edge 150 / Windows (D3D11) |
 |---|---|---|
 | `prefer-hardware`, `optimizeForLatency: true`, recorded pacing | 18 | 35 |
 | `prefer-hardware`, `optimizeForLatency: true`, full speed | 18 (same frames) | 35 |
@@ -59,6 +59,38 @@ at the platform decoder or at the stream.
   unrelated difference in which its *software* decode appears to overexpose
   frames, which inflates its raw diff count; the stale-macroblock pattern is
   absent from its hardware output.)
+
+## The result does not depend on how the pixels are read back
+
+Reasonable first objection: `drawImage` + `getImageData` sends a
+hardware-decoded frame (NV12, GPU) through a YUV→RGB conversion that a
+software-decoded frame (I420, CPU) does not take, so a difference measured that
+way could in principle live in the conversion rather than in the decode.
+
+The page therefore reads pixels back three independent ways and compares each
+hardware run only against a software run read back **the same** way, so a
+readback artifact cancels instead of counting as a decoder defect:
+
+| pixel readback | conversion involved | frames differing (Chrome 150, macOS) |
+|---|---|---|
+| `drawImage` + `getImageData` | canvas YUV→RGB | 18 |
+| `VideoFrame.copyTo({format:'RGBA'})` | WebCodecs YUV→RGB | 18 |
+| `VideoFrame.copyTo()`, native format, **luma plane only** | **none** | 18 |
+
+All three flag **the identical frames** — indices 56–65 and 183–192. The third
+row is the decisive one: it compares plane 0 of the frame's native format (NV12
+from the hardware decoder, I420 from the software decoder), which is
+full-resolution 8-bit luma in both. No RGB conversion exists anywhere in that
+path, so the wrong pixels are in the decoded frame itself.
+
+One normalization is applied in that third row and is worth stating explicitly:
+on this platform the software decoder reports **full-range** luma while the
+hardware decoder reports **limited (studio) range**, so identical content lands
+~18 levels apart in raw plane bytes (≈238 vs ≈220). That is range *signalling*,
+not a decode difference; uncorrected it makes all 240 frames trivially differ.
+Limited-range luma is expanded to full range before comparison, after which
+clean frames agree to within ~0.4 levels — far below the 8-level threshold,
+while the defect shows ~35.
 
 ## Why the input is known-good
 

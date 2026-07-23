@@ -70,8 +70,9 @@
 <table id="results">
   <thead>
     <tr>
-      <th>variant</th><th>hardwareAcceleration</th><th>optimizeForLatency</th>
-      <th>pacing</th><th>outputs</th><th>errors</th><th>frames differing from software</th>
+      <th>variant</th><th>hardwareAcceleration</th><th>pixel readback</th>
+      <th>VideoFrame.format</th><th>pacing</th><th>outputs</th><th>errors</th>
+      <th>frames differing from software</th>
     </tr>
   </thead>
   <tbody></tbody>
@@ -105,14 +106,21 @@ const BLOCK = 16;
 // observed stale-macroblock shift is ~17+. Midpoint keeps both margins wide.
 const THRESHOLD = 8.0;
 
+// Each variant is compared against the software run using the SAME readback
+// path, so a readback artifact would cancel out instead of being attributed to
+// the decoder.
 const VARIANTS = [
-  // Software first: it is the conformant baseline every other variant is
-  // compared against.
-  { name: 'sw-lowlat-paced',     hw: 'prefer-software', lowLatency: true,  paced: true },
-  { name: 'hw-lowlat-paced',     hw: 'prefer-hardware', lowLatency: true,  paced: true },
-  { name: 'hw-plain-paced',      hw: 'prefer-hardware', lowLatency: false, paced: true },
-  { name: 'hw-lowlat-fast',      hw: 'prefer-hardware', lowLatency: true,  paced: false },
-  { name: 'nopref-lowlat-paced', hw: 'no-preference',   lowLatency: true,  paced: true },
+  // Software first per readback mode: it is the conformant baseline.
+  { name: 'sw-lowlat-paced',     hw: 'prefer-software', lowLatency: true,  paced: true,  readback: 'drawImage' },
+  { name: 'hw-lowlat-paced',     hw: 'prefer-hardware', lowLatency: true,  paced: true,  readback: 'drawImage' },
+  { name: 'hw-plain-paced',      hw: 'prefer-hardware', lowLatency: false, paced: true,  readback: 'drawImage' },
+  { name: 'hw-lowlat-fast',      hw: 'prefer-hardware', lowLatency: true,  paced: false, readback: 'drawImage' },
+  { name: 'nopref-lowlat-paced', hw: 'no-preference',   lowLatency: true,  paced: true,  readback: 'drawImage' },
+  // Readback-independence checks (full speed; pacing is already shown irrelevant).
+  { name: 'sw-copyto-rgba',      hw: 'prefer-software', lowLatency: true,  paced: false, readback: 'copyTo-rgba' },
+  { name: 'hw-copyto-rgba',      hw: 'prefer-hardware', lowLatency: true,  paced: false, readback: 'copyTo-rgba' },
+  { name: 'sw-copyto-luma',      hw: 'prefer-software', lowLatency: true,  paced: false, readback: 'copyTo-luma' },
+  { name: 'hw-copyto-luma',      hw: 'prefer-hardware', lowLatency: true,  paced: false, readback: 'copyTo-luma' },
 ];
 
 const statusEl = document.getElementById('status');
@@ -145,6 +153,71 @@ async function loadDump() {
   return { bin, frames };
 }
 
+// --- Pixel readback paths -------------------------------------------------
+// drawImage + getImageData sends a hardware-decoded frame through a GPU
+// YUV->RGB conversion that a software-decoded frame does not take, so on its
+// own it cannot separate "the decoder produced wrong pixels" from "the
+// conversion produced wrong pixels". The two paths below remove that variable.
+
+function repackPlane(buf, layout, width, height, bytesPerPixel) {
+  const { offset, stride } = layout;
+  const rowBytes = width * bytesPerPixel;
+  if (offset === 0 && stride === rowBytes && buf.length === rowBytes * height) return buf;
+  const out = new Uint8ClampedArray(rowBytes * height);
+  for (let y = 0; y < height; y++) {
+    const start = offset + y * stride;
+    out.set(buf.subarray(start, start + rowBytes), y * rowBytes);
+  }
+  return out;
+}
+
+// VideoFrame.copyTo with format: 'RGBA' — WebCodecs' own conversion, not the
+// canvas path. This is the check the reviewer asked for.
+async function regionViaCopyToRgba(frame) {
+  const options = {
+    rect: { x: REGION.x, y: REGION.y, width: REGION.w, height: REGION.h },
+    format: 'RGBA',
+  };
+  const buf = new Uint8ClampedArray(frame.allocationSize(options));
+  const layout = await frame.copyTo(buf, options);
+  return new ImageData(repackPlane(buf, layout[0], REGION.w, REGION.h, 4), REGION.w, REGION.h);
+}
+
+// copyTo with NO format option: the frame's native format (NV12 from the
+// hardware decoder, I420 from the software decoder). Plane 0 is full-resolution
+// 8-bit luma in both, so this compares raw decoder output with NO RGB
+// conversion anywhere in the path. Rendered as gray so the same grid/diff code
+// applies.
+//
+// One normalization is required and is disclosed in the results table: on this
+// platform the software decoder reports full-range luma and the hardware
+// decoder reports limited (studio) range, so raw plane bytes are offset by a
+// constant (~238 vs ~220 on identical content). That is a signalling
+// difference, not a decode difference, and without correcting for it EVERY
+// frame trivially "differs". Limited-range luma is expanded to full range so
+// the two are compared in the same space; on clean frames the two then agree to
+// within ~0.4 levels, far below the 8-level threshold.
+function lumaRangeScale(frame) {
+  return frame.colorSpace?.fullRange === false
+    ? (y) => Math.max(0, Math.min(255, (y - 16) * (255 / 219)))
+    : (y) => y;
+}
+
+async function regionViaCopyToLuma(frame) {
+  const options = { rect: { x: REGION.x, y: REGION.y, width: REGION.w, height: REGION.h } };
+  const buf = new Uint8ClampedArray(frame.allocationSize(options));
+  const layout = await frame.copyTo(buf, options);
+  const luma = repackPlane(buf, layout[0], REGION.w, REGION.h, 1);
+  const toFullRange = lumaRangeScale(frame);
+  const img = new ImageData(REGION.w, REGION.h);
+  for (let k = 0; k < luma.length; k++) {
+    const y = toFullRange(luma[k]);
+    img.data[4 * k] = img.data[4 * k + 1] = img.data[4 * k + 2] = y;
+    img.data[4 * k + 3] = 255;
+  }
+  return img;
+}
+
 function blockGrid(imageData) {
   const { data, width, height } = imageData;
   const cols = width / BLOCK, rows = height / BLOCK;
@@ -164,12 +237,13 @@ function blockGrid(imageData) {
   return grid;
 }
 
-async function runVariant({ name, hw, lowLatency, paced }, dump, regionStore) {
-  setStatus(`running ${name} (${hw})…`);
+async function runVariant({ name, hw, lowLatency, paced, readback }, dump, regionStore) {
+  setStatus(`running ${name} (${hw}, ${readback})…`);
   const config = { codec: CODEC, hardwareAcceleration: hw, optimizeForLatency: lowLatency };
   const support = await VideoDecoder.isConfigSupported(config).catch((e) => ({ error: String(e) }));
   const result = {
-    name, hw, lowLatency, paced,
+    name, hw, lowLatency, paced, readback,
+    frameFormat: null,
     userAgent: navigator.userAgent,
     supported: support?.supported ?? null,
     supportError: support?.error ?? null,
@@ -190,24 +264,38 @@ async function runVariant({ name, hw, lowLatency, paced }, dump, regionStore) {
   let outstanding = 0;
   let submittedAll = false;
 
+  const pendingWork = [];
   const decoder = new VideoDecoder({
     output: (frame) => {
-      try {
-        const index = byTimestamp.get(frame.timestamp);
-        const t = submitAt.get(frame.timestamp);
-        if (t !== undefined) decodeMs.push(performance.now() - t);
-        ctx.drawImage(frame, 0, 0);
-        const img = ctx.getImageData(REGION.x, REGION.y, REGION.w, REGION.h);
-        result.frames.push({ i: index, grid: blockGrid(img) });
-        if (regionStore) regionStore.set(index, img);
-        result.outputs++;
-      } catch (err) {
-        result.errors.push(`output ${frame.timestamp}: ${err}`);
-      } finally {
-        frame.close();
-        outstanding--;
-        if (submittedAll && outstanding === 0) resolveDone();
+      const index = byTimestamp.get(frame.timestamp);
+      const t = submitAt.get(frame.timestamp);
+      if (t !== undefined) decodeMs.push(performance.now() - t);
+      if (result.frameFormat === null) {
+        result.frameFormat = frame.format ?? 'unknown';
+        result.fullRange = frame.colorSpace?.fullRange ?? null;
       }
+      // copyTo is async and the frame must stay open until it resolves, so the
+      // whole readback runs as tracked work rather than inline.
+      pendingWork.push((async () => {
+        try {
+          let img;
+          if (readback === 'copyTo-rgba') img = await regionViaCopyToRgba(frame);
+          else if (readback === 'copyTo-luma') img = await regionViaCopyToLuma(frame);
+          else {
+            ctx.drawImage(frame, 0, 0);
+            img = ctx.getImageData(REGION.x, REGION.y, REGION.w, REGION.h);
+          }
+          result.frames.push({ i: index, grid: blockGrid(img) });
+          if (regionStore) regionStore.set(index, img);
+          result.outputs++;
+        } catch (err) {
+          result.errors.push(`output ${frame.timestamp}: ${err}`);
+        } finally {
+          frame.close();
+          outstanding--;
+          if (submittedAll && outstanding === 0) resolveDone();
+        }
+      })());
     },
     error: (err) => {
       result.errors.push(`decoder error: ${err?.message ?? err}`);
@@ -345,14 +433,16 @@ function renderDiffSection(baseline, variant, ids, divergent) {
 function addRow(r, divergentCount) {
   const tr = document.createElement('tr');
   const cells = [
-    r.name, r.hw, String(r.lowLatency), r.paced ? 'recorded' : 'full speed',
+    r.name, r.hw, r.readback,
+    `${r.frameFormat ?? '—'}${r.fullRange === false ? ' (limited)' : r.fullRange === true ? ' (full)' : ''}`,
+    r.paced ? 'recorded' : 'full speed',
     `${r.outputs}`, `${r.errors.length}`,
     divergentCount === null ? 'baseline' : `${divergentCount}`,
   ];
   cells.forEach((text, k) => {
     const td = document.createElement('td');
     td.textContent = text;
-    if (k === 6 && divergentCount !== null) {
+    if (k === 7 && divergentCount !== null) {
       td.className = divergentCount > 0 ? 'diverge-yes' : 'diverge-no';
     }
     tr.appendChild(td);
@@ -366,15 +456,19 @@ try {
   log(`loaded ${dump.frames.length} access units, ${dump.bin.byteLength} bytes, ${WIDTH}x${HEIGHT}`);
   const ids = new Map(dump.frames.map((f) => [f.index, f.frameId]));
   const all = [];
-  let baseline = null;
+  // One software baseline PER readback path: each hardware run is only ever
+  // compared against software read back exactly the same way, so any artifact
+  // of the readback itself cancels instead of counting as a decoder defect.
+  const baselines = new Map();
   let worstDivergence = 0;
 
   for (const variant of VARIANTS) {
     const store = new Map();
     const r = await runVariant(variant, dump, store);
     all.push(r);
+    const baseline = baselines.get(variant.readback);
     if (!baseline && variant.hw === 'prefer-software' && r.outputs > 0) {
-      baseline = { result: r, store };
+      baselines.set(variant.readback, { result: r, store });
       addRow(r, null);
       continue;
     }
@@ -401,7 +495,9 @@ try {
       'and chrome://gpu), or the defect may not affect this decoder.';
   }
 
-  const blob = new Blob([JSON.stringify({ fixture: FIXTURE, results: all }, null, 2)],
+  // Also exposed on window so results can be grabbed straight from devtools.
+  self.__webcodecsReproResults = { fixture: FIXTURE, userAgent: navigator.userAgent, results: all };
+  const blob = new Blob([JSON.stringify(self.__webcodecsReproResults, null, 2)],
                         { type: 'application/json' });
   const btn = document.getElementById('download');
   btn.disabled = false;
